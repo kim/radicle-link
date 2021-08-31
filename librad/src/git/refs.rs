@@ -313,12 +313,13 @@ impl Refs {
     /// If the blob where the signed [`Refs`] are expected to be stored is not
     /// found, `None` is returned.
     #[tracing::instrument(level = "debug", skip(storage, urn), fields(urn = %urn))]
-    pub fn load<S, P>(storage: &S, urn: &Urn, peer: P) -> Result<Option<Self>, stored::Error>
+    pub fn load<'a, S, P>(storage: &S, urn: &Urn, peer: P) -> Result<Option<Self>, stored::Error>
     where
         S: AsRef<storage::ReadOnly>,
         P: Into<Option<PeerId>> + Debug,
     {
-        load(storage, urn, peer).map(|may| may.map(|Loaded { refs, .. }| Self::from(refs)))
+        let peer = peer.into();
+        load(storage, urn, peer.as_ref()).map(|may| may.map(|Loaded { refs, .. }| Self::from(refs)))
     }
 
     /// Compute the current [`Refs`], sign them, and store them at the
@@ -583,8 +584,7 @@ impl Serialize for Signed<Verified> {
 }
 
 pub(crate) struct Loaded {
-    #[allow(unused)]
-    pub at_commit: git_ext::Oid,
+    pub at: git_ext::Oid,
     pub refs: Signed<Verified>,
 }
 
@@ -618,9 +618,30 @@ where
                 .blob_at(at_commit, path)?
                 .map(|blob| Signed::from_json(blob.content(), &signer))
                 .transpose()
-                .map_err(stored::Error::from)?;
+                .map_err(stored::Error::from)?
+                .map(|refs| Loaded { at, refs });
 
             Ok(maybe_refs.map(|refs| Loaded { at_commit, refs }))
         },
     }
+}
+
+pub(crate) fn load_at<S>(
+    storage: S,
+    at: git_ext::Oid,
+    peer: Option<&PeerId>,
+) -> Result<Option<Loaded>, stored::Error>
+where
+    S: AsRef<storage::ReadOnly>,
+{
+    let signer = peer.unwrap_or_else(|| storage.as_ref().peer_id());
+    let loaded = storage
+        .as_ref()
+        .blob_at(at, Path::new(stored::BLOB_PATH))?
+        .map(|blob| Signed::from_json(blob.content(), signer))
+        .transpose()
+        .map_err(stored::Error::from)?
+        .map(|refs| Loaded { at, refs });
+
+    Ok(loaded)
 }
