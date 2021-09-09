@@ -7,7 +7,6 @@ use std::{
     collections::{BTreeSet, HashMap},
     convert::TryFrom,
     ops::Deref,
-    path::Path,
     time::Duration,
 };
 
@@ -25,9 +24,11 @@ use link_replication::{
     Namespace,
     Negotiation,
     Net,
+    ObjectId,
     Refdb,
     SignedRefs,
     Sigrefs,
+    SkippedFetch,
     Tracking,
     Update,
     VerifiedIdentity,
@@ -58,14 +59,11 @@ pub mod error {
 
     #[derive(Debug, Error)]
     pub enum Verification {
-        #[error("{0} does not resolve to a ref")]
-        NoSuchUrn(identities::git::Urn),
-
         #[error("unknown identity kind")]
         UnknownIdentityKind(Box<SomeIdentity>),
 
-        #[error("delegate identity not found")]
-        MissingDelegate(Urn),
+        #[error("delegate identity {0} not found")]
+        MissingDelegate(identities::git::Urn),
 
         #[error(transparent)]
         Person(#[from] Box<identities::error::VerifyPerson>),
@@ -118,12 +116,12 @@ pub mod error {
     }
 }
 
-type Network = io::Network<Urn, io::Refdb, quic::Connection>;
+type Network = io::Network<Urn, io::Refdb<io::Odb>, io::Odb, quic::Connection>;
 
 pub struct Context<'a> {
     urn: Urn,
     store: &'a Storage,
-    refdb: io::Refdb,
+    refdb: io::Refdb<io::Odb>,
     net: Network,
 }
 
@@ -132,18 +130,19 @@ impl<'a> Context<'a> {
         store: &'a Storage,
         conn: quic::Connection,
         urn: Urn,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync + 'static>> {
         let info = io::UserInfo {
             name: store.config()?.user_name()?,
             peer_id: *store.peer_id(),
         };
 
         let git_dir = store.path();
-        let refdb = io::Refdb::new(info.clone(), git_dir, &urn)?;
-        let net = io::Network::new(refdb, conn, git_dir, urn.clone());
-
-        // XXX: We need a second refdb due to the 'static requirement for async
-        let refdb = io::Refdb::new(info, git_dir, &urn)?;
+        let odb = io::Odb::at(git_dir)?;
+        let net = {
+            let refdb = io::Refdb::new(info.clone(), git_dir, odb.clone(), &urn)?;
+            io::Network::new(refdb, conn, git_dir, urn.clone())
+        };
+        let refdb = io::Refdb::new(info, git_dir, odb, &urn)?;
 
         Ok(Self {
             urn,
@@ -179,7 +178,7 @@ impl<'a> Context<'a> {
                         let urn = Urn(urn);
                         resolve(&urn)
                             .map(|oid| git_ext::Oid::from(oid.as_ref().to_owned()).into())
-                            .ok_or(error::Verification::MissingDelegate(urn))
+                            .ok_or(error::Verification::MissingDelegate(urn.0))
                     },
                 )?;
                 Ok(SomeVerifiedIdentity::Project(verified))
@@ -213,6 +212,14 @@ impl VerifiedIdentity for SomeVerifiedIdentity {
             Self::Person(p) => p.content_id,
             Self::Project(p) => p.content_id,
         }
+    }
+
+    fn urn(&self) -> Self::Urn {
+        match self {
+            Self::Person(p) => p.urn(),
+            Self::Project(p) => p.urn(),
+        }
+        .into()
     }
 
     fn delegate_ids(&self) -> NonEmpty<BTreeSet<PeerId>> {
@@ -257,6 +264,12 @@ impl VerifiedIdentity for SomeVerifiedIdentity {
 
 #[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub struct Urn(identities::git::Urn);
+
+impl From<identities::git::Urn> for Urn {
+    fn from(urn: identities::git::Urn) -> Self {
+        Self(urn)
+    }
+}
 
 impl Deref for Urn {
     type Target = identities::git::Urn;
@@ -309,20 +322,6 @@ impl Identities for Context<'_> {
         self.verify(id, resolve)
     }
 
-    fn verify_urn<F, T>(
-        &self,
-        urn: &Self::Urn,
-        resolve: F,
-    ) -> Result<Self::VerifiedIdentity, Self::VerificationError>
-    where
-        F: Fn(&Self::Urn) -> Option<T>,
-        T: AsRef<oid>,
-    {
-        let id = git::identities::any::get(&self.store, urn)?
-            .ok_or_else(|| error::Verification::NoSuchUrn(urn.0.clone()))?;
-        self.verify(id, resolve)
-    }
-
     fn newer(
         &self,
         a: Self::VerifiedIdentity,
@@ -349,7 +348,7 @@ impl Identities for Context<'_> {
                 .newer(x, y)
                 .map(Project)
                 .map_err(|e| Error::Other(Box::new(e))),
-            (x, y) => Err(Error::Fork { a: x, b: y }),
+            (x, y) => Err(Error::TypeMismatch { a: x, b: y }),
         }
     }
 }
@@ -359,12 +358,36 @@ impl SignedRefs for Context<'_> {
     type Error = error::Sigrefs;
 
     fn load(&self, of: &PeerId, cutoff: usize) -> Result<Option<Sigrefs<Self::Oid>>, Self::Error> {
-        match refs::load(&self.store, &self.urn, *of)? {
+        match refs::load(&self.store, &self.urn, Some(of))? {
             None => Ok(None),
-            Some(refs::Loaded {
-                at_commit: at,
-                refs: signed,
-            }) => {
+            Some(refs::Loaded { at, refs: signed }) => {
+                let refs = signed
+                    .iter_categorised()
+                    .map(|((name, oid), cat)| (format!("refs/{}/{}", cat, name).into(), *oid))
+                    .collect::<HashMap<_, _>>();
+                let mut remotes = refs::Refs::from(signed).remotes;
+                remotes.cutoff_mut(cutoff);
+                let remotes = remotes.flatten().fold(BTreeSet::new(), |mut acc, id| {
+                    if !acc.contains(id) {
+                        acc.insert(*id);
+                    }
+                    acc
+                });
+
+                Ok(Some(Sigrefs { at, refs, remotes }))
+            },
+        }
+    }
+
+    fn load_at(
+        &self,
+        treeish: impl Into<ObjectId>,
+        signed_by: &PeerId,
+        cutoff: usize,
+    ) -> Result<Option<Sigrefs<Self::Oid>>, Self::Error> {
+        match refs::load_at(&self.store, treeish.into().into(), Some(signed_by))? {
+            None => Ok(None),
+            Some(refs::Loaded { at, refs: signed }) => {
                 let refs = signed
                     .iter_categorised()
                     .map(|((name, oid), cat)| (format!("refs/{}/{}", cat, name).into(), *oid))
@@ -411,17 +434,17 @@ impl SignedRefs for Context<'_> {
 }
 
 impl Tracking for Context<'_> {
+    type Urn = Urn;
     type Tracked = Tracked;
     type Error = tracking::Error;
 
-    fn track(&self, id: &PeerId) -> Result<(), Self::Error> {
-        tracking::track(self.store, &self.urn, *id).map(|_| ())
+    fn track(&mut self, id: &PeerId, urn: Option<&Self::Urn>) -> Result<(), Self::Error> {
+        tracking::track(self.store, urn.unwrap_or(&self.urn), *id).map(|_| ())
     }
 
-    fn tracked(&self) -> Self::Tracked {
-        Tracked {
-            inner: Some(tracking::tracked(self.store, &self.urn)),
-        }
+    fn tracked(&self, urn: Option<&Self::Urn>) -> Self::Tracked {
+        let inner = Some(tracking::tracked(self.store, urn.unwrap_or(&self.urn)));
+        Tracked { inner }
     }
 }
 
@@ -452,13 +475,14 @@ impl Iterator for Tracked {
 }
 
 impl Refdb for Context<'_> {
-    type Oid = <io::Refdb as Refdb>::Oid;
+    type Oid = <io::Refdb<io::Odb> as Refdb>::Oid;
 
-    type Scan<'a> = <io::Refdb as Refdb>::Scan<'a>;
+    type Scan<'a> = <io::Refdb<io::Odb> as Refdb>::Scan<'a>;
 
-    type FindError = <io::Refdb as Refdb>::FindError;
-    type ScanError = <io::Refdb as Refdb>::ScanError;
-    type TxError = <io::Refdb as Refdb>::TxError;
+    type FindError = <io::Refdb<io::Odb> as Refdb>::FindError;
+    type ScanError = <io::Refdb<io::Odb> as Refdb>::ScanError;
+    type TxError = <io::Refdb<io::Odb> as Refdb>::TxError;
+    type ReloadError = <io::Refdb<io::Odb> as Refdb>::ReloadError;
 
     fn refname_to_id(
         &self,
@@ -470,16 +494,20 @@ impl Refdb for Context<'_> {
     fn scan<O, P>(&self, prefix: O) -> Result<Self::Scan<'_>, Self::ScanError>
     where
         O: Into<Option<P>>,
-        P: AsRef<Path>,
+        P: AsRef<str>,
     {
-        self.refdb.scan(prefix.into())
+        self.refdb.scan(prefix)
     }
 
-    fn update<'a, I>(&self, updates: I) -> Result<Applied<'a>, Self::TxError>
+    fn update<'a, I>(&mut self, updates: I) -> Result<Applied<'a>, Self::TxError>
     where
         I: IntoIterator<Item = Update<'a>>,
     {
         self.refdb.update(updates)
+    }
+
+    fn reload(&mut self) -> Result<(), Self::ReloadError> {
+        self.refdb.reload()
     }
 }
 
@@ -490,10 +518,10 @@ impl Net for Context<'_> {
     async fn run_fetch<N, T>(
         &self,
         neg: N,
-    ) -> Result<(N, Vec<FilteredRef<'static, T>>), Self::Error>
+    ) -> Result<(N, Result<Vec<FilteredRef<T>>, SkippedFetch>), Self::Error>
     where
         N: Negotiation<T> + Send,
-        T: Send,
+        T: Send + 'static,
     {
         self.net.run_fetch(neg).await
     }
@@ -509,7 +537,7 @@ impl io::Connection for quic::Connection {
         use net::connection::Duplex as _;
 
         let bi = self.open_bidi().await?;
-        let up = upgrade::upgrade(bi, upgrade::Git2).await?;
+        let up = upgrade::upgrade(bi, upgrade::Git).await?;
         Ok(up.into_stream().split())
     }
 }

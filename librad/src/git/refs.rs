@@ -324,7 +324,7 @@ impl Refs {
 
     /// Compute the current [`Refs`], sign them, and store them at the
     /// `rad/signed_refs` branch of [`Urn`].
-    #[tracing::instrument(skip(storage, urn), fields(urn = %urn))]
+    #[tracing::instrument(skip(storage, urn), fields(urn = %urn, local_peer = %storage.peer_id()))]
     pub fn update(storage: &Storage, urn: &Urn) -> Result<Updated, stored::Error> {
         let branch = Reference::rad_signed_refs(Namespace::from(urn), None);
         tracing::debug!("updating signed refs for {}", branch);
@@ -371,10 +371,11 @@ impl Refs {
         match commit {
             Ok(commit_id) => {
                 tracing::trace!(
-                    "updated signed refs at {} to {}: {:?}",
-                    branch,
-                    commit_id,
-                    signed_refs.refs
+                    ?signed_refs.refs,
+                    %branch,
+                    head = %commit_id,
+                    parent = ?parent.as_ref().map(|commit| commit.id()),
+                    "updated signed refs for {}", urn
                 );
 
                 Ok(Updated::Updated {
@@ -588,40 +589,28 @@ pub(crate) struct Loaded {
     pub refs: Signed<Verified>,
 }
 
-pub(crate) fn load<S, P>(storage: &S, urn: &Urn, peer: P) -> Result<Option<Loaded>, stored::Error>
+pub(crate) fn load<S>(
+    storage: S,
+    urn: &Urn,
+    peer: Option<&PeerId>,
+) -> Result<Option<Loaded>, stored::Error>
 where
     S: AsRef<storage::ReadOnly>,
-    P: Into<Option<PeerId>> + Debug,
 {
-    let storage = storage.as_ref();
-    let peer = peer.into();
-    let signer = peer.unwrap_or_else(|| *storage.peer_id());
-
-    let sigrefs = Reference::rad_signed_refs(Namespace::from(urn), peer);
-    let at = storage.reference_oid(&sigrefs).map(Some).or_matches(
-        |e| matches!(e, storage::read::Error::Git(e) if is_not_found_err(e)),
-        || Ok::<_, storage::read::Error>(None),
-    )?;
-    match at {
+    let sigrefs = Reference::rad_signed_refs(Namespace::from(urn), peer.copied());
+    let tip = storage
+        .as_ref()
+        .reference_oid(&sigrefs)
+        .map(Some)
+        .or_matches(
+            |e| matches!(e, storage::read::Error::Git(e) if is_not_found_err(e)),
+            || Ok::<_, storage::read::Error>(None),
+        )?;
+    match tip {
         None => Ok(None),
-        Some(at_commit) => {
-            let path = Path::new(stored::BLOB_PATH);
-
-            tracing::debug!(
-                "loading signed_refs from {}:{} {}",
-                &sigrefs,
-                &at_commit,
-                path.display()
-            );
-
-            let maybe_refs = storage
-                .blob_at(at_commit, path)?
-                .map(|blob| Signed::from_json(blob.content(), &signer))
-                .transpose()
-                .map_err(stored::Error::from)?
-                .map(|refs| Loaded { at, refs });
-
-            Ok(maybe_refs.map(|refs| Loaded { at_commit, refs }))
+        Some(at) => {
+            tracing::debug!("loading signed_refs from {}:{}", &sigrefs, &at);
+            load_at(storage, at, peer)
         },
     }
 }
