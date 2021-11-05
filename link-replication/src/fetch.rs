@@ -6,9 +6,11 @@
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashSet},
+    iter,
 };
 
-use bstr::{BStr, BString, ByteSlice as _, ByteVec as _};
+use bstr::{BStr, BString, ByteSlice as _};
+use itertools::Itertools;
 use link_crypto::PeerId;
 use link_git_protocol::{oid, Ref};
 
@@ -93,52 +95,33 @@ impl<T: AsRef<oid>> Negotiation for Fetch<T> {
 
     fn ref_filter(&self, r: Ref) -> Option<FilteredRef<Self>> {
         use either::Either::*;
-        use refs::parsed::{Cat, Identity, Refs};
+        use refs::parsed::{Identity, Refs};
 
         let (refname, tip) = refs::into_unpacked(r);
         let parsed = refs::parse::<Identity>(refname.as_bstr())?;
         match &parsed.inner {
-            Right(Refs { cat, name, .. }) => match cat {
-                // Only known "standard" refs.
-                //
-                // Peeking should've already gotten us the "rad" refs, and by
-                // ignoring them here we don't have to worry about the remote
-                // end becoming inconsistent between peek and fetch.
-                //
-                // XXX: allow to configure fetching "strange" refs
-                Cat::Unknown(_) => {
-                    warn!("skipping unknown cat {}", cat);
-                    None
-                },
-                Cat::Heads | Cat::Notes | Cat::Tags | Cat::Cob => {
-                    let refname_no_remote = {
-                        let mut x = BString::from(refs::component::REFS);
-                        x.push_byte(refs::SEPARATOR);
-                        x.push_str(cat.as_bytes());
-                        x.push_byte(refs::SEPARATOR);
-                        for (i, y) in name.iter().enumerate() {
-                            if i > 0 {
-                                x.push_byte(refs::SEPARATOR);
-                            }
-                            x.push_str(y);
-                        }
-                        x
-                    };
-                    let remote_id = *parsed.remote.as_ref().unwrap_or(&self.remote_id);
-                    if self.is_tracked(&remote_id) || self.is_signed(&remote_id, &refname_no_remote)
-                    {
-                        Some(FilteredRef::new(refname, tip, &remote_id, parsed))
-                    } else {
-                        warn!(
-                            %refname_no_remote,
-                            "skipping {} as it is neither signed nor tracked", refname
-                        );
-                        None
-                    }
-                },
-            },
-
+            // Ignore rad/ refs, as we got them already during the peek phase.
             Left(_) => None,
+            // TODO: evaluate fetch specs, as per rfc0699
+            Right(Refs { cat, name, .. }) => {
+                let refname_no_remote: BString = Itertools::intersperse(
+                    iter::once(refs::component::REFS)
+                        .chain(Some(cat.as_bytes()))
+                        .chain(name.iter().map(|x| x.as_slice())),
+                    &[refs::SEPARATOR],
+                )
+                .collect();
+                let remote_id = *parsed.remote.as_ref().unwrap_or(&self.remote_id);
+                if self.is_tracked(&remote_id) || self.is_signed(&remote_id, &refname_no_remote) {
+                    Some(FilteredRef::new(refname, tip, &remote_id, parsed))
+                } else {
+                    warn!(
+                        %refname_no_remote,
+                        "skipping {} as it is neither signed nor tracked", refname
+                    );
+                    None
+                }
+            },
         }
     }
 
