@@ -9,142 +9,215 @@
 //! particular, ref name parameters are generally expected to be pre-validated
 //! in some way, and should never be empty.
 
-use std::{borrow::Cow, ops::Deref};
+use std::{
+    fmt::{self, Display},
+    iter,
+    ops::Deref,
+};
 
-use bstr::{BStr, BString, ByteVec as _};
 use either::{
     Either,
     Either::{Left, Right},
 };
+use git_ref_format::{name, Component, RefStr, RefString};
 use link_crypto::PeerId;
 
-use super::{is_separator, Prefix};
+use super::{from_peer_id, lit, parsed};
+use crate::Urn;
 
-/// A ref which optionally is relative to a namespace.
+pub use git_ref_format::{Namespaced, Qualified};
+
+/// Add a (`link`) namespace (of type [`Urn`] to `name`.
 ///
-/// The fully qualified name can be obtained lazily using
-/// [`Namespaced::qualified`].
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-pub struct Namespaced<'a> {
-    pub namespace: Option<Cow<'a, BStr>>,
-    pub refname: Cow<'a, BStr>,
-}
-
-impl Namespaced<'_> {
-    pub fn qualified(&self) -> BString {
-        const PREFIX: &str = "refs/namespaces/";
-
-        let mut name = BString::from(self.refname.as_ref());
-        if let Some(ns) = &self.namespace {
-            name.insert_str(0, PREFIX);
-            name.insert_str(PREFIX.len(), ns.as_ref());
-            name.insert_char(PREFIX.len() + ns.len(), '/');
-        }
-        name
-    }
-
-    pub fn into_owned(self) -> Namespaced<'static> {
-        Namespaced {
-            namespace: self.namespace.map(|ns| Cow::Owned(ns.into_owned())),
-            refname: Cow::Owned(self.refname.into_owned()),
-        }
-    }
+/// `name` should not already be namespaced, but this condition is not checked.
+/// It is thus possible for the returned [`Namespaced`] to have more than one
+/// namespace.
+pub fn namespaced<'a, U, Q>(ns: &U, name: Q) -> Namespaced<'a>
+where
+    U: Urn,
+    Q: Into<Qualified<'a>>,
+{
+    let ns = Component::from_refstring(super::from_urn(ns))
+        .expect("urn is a valid component")
+        .to_owned();
+    name.into().add_namespace(ns)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-pub struct RemoteTracking<'a>(Cow<'a, BStr>);
+pub struct RemoteTracking<'a>(Qualified<'a>);
 
 /// Ensure that the ref `name` is a remote tracking branch.
 ///
-/// If `name` starts with `refs/remotes/`, this is the identity function.
-/// Otherwise, `refs/remotes/<remote_id>/` is prepended. This will handle `name`
-/// being prefixed by `refs/`; eg. `refs/heads/main` will be rewritten to
+/// If `name` starts with "refs/remotes/", this is the identity function.
+/// Otherwise, "refs/remotes/`remote_id`/" is prepended. Note that the `link`
+/// naming convention applies, which, unlike standard git, mandates a category
+/// after the remote name. Eg.:
 ///
-///     refs/remotes/<remote_id>/heads/main
+///     refs/remotes/xyz/heads/main
+///     refs/remotes/xyz/rad/id
 ///
-/// not
-///     refs/remotes/<remote_id>/refs/heads/main
+/// If `name` is not a remote tracking branch (ie. does not start with
+/// "refs/remotes/"), it must have at least three components, so as to enforce
+/// that it has a category (eg. "refs/heads/main").
 ///
-/// Note that if `name` is not prefixed, it is inserted verbatim. Thus it must
-/// still include the category (ie. `heads/main`, not `main`).
+/// If `name` is namespaced (ie. it starts with "refs/namespaces/"), namespaces
+/// are stripped recursively.
 pub fn remote_tracking<'a>(
     remote_id: &PeerId,
-    name: impl Into<Cow<'a, BStr>>,
-) -> RemoteTracking<'a> {
-    use super::component::REFS;
-
-    let mut name = name.into();
-    if !name.starts_with(Prefix::Remotes.as_bytes()) {
-        let name = name.to_mut();
-        if name.starts_with(REFS) {
-            name.insert_str(REFS.len() + 1, format!("remotes/{}/", remote_id));
-        } else {
-            name.insert_str(0, format!("refs/remotes/{}/", remote_id));
-        }
+    name: impl Into<Qualified<'a>>,
+) -> Option<RemoteTracking<'a>> {
+    let name = name.into();
+    let mut iter = name.components();
+    {
+        let refs = iter.next().and_then(|c| c.as_lit())?;
+        debug_assert_eq!(lit::Refs, refs, "`Qualified` must start with 'refs/'");
     }
-    RemoteTracking(name)
+    match (iter.next()?.as_str(), iter.next()?) {
+        (name::str::REMOTES, _) => {
+            let _cat = iter.next()?;
+            let _name = iter.next()?;
+            let q = Qualified::from((
+                lit::Refs,
+                lit::Remotes,
+                from_peer_id(remote_id).and(name.components().skip(3).collect::<RefString>()),
+            ));
+            Some(RemoteTracking(q))
+        },
+        (name::str::NAMESPACES, _) => remote_tracking(
+            remote_id,
+            name.namespaced()
+                .expect("name is namespaced")
+                .strip_namespace_recursive(),
+        ),
+        (_, _) => {
+            // SAFETY: pattern match proves that there are at least two
+            // components after "refs".
+            let rest = name.components().skip(1).collect::<RefString>();
+            let q = Qualified::from((lit::Refs, lit::Remotes, from_peer_id(remote_id).and(rest)));
+            Some(RemoteTracking(q))
+        },
+    }
 }
 
-impl Deref for RemoteTracking<'_> {
-    type Target = BStr;
+impl<'a> Deref for RemoteTracking<'a> {
+    type Target = Qualified<'a>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl AsRef<BStr> for RemoteTracking<'_> {
-    fn as_ref(&self) -> &BStr {
+impl<'a> AsRef<Qualified<'a>> for RemoteTracking<'a> {
+    fn as_ref(&self) -> &Qualified<'a> {
         self
     }
 }
 
-impl<'a> From<RemoteTracking<'a>> for Cow<'a, BStr> {
+impl AsRef<RefStr> for RemoteTracking<'_> {
+    fn as_ref(&self) -> &RefStr {
+        self
+    }
+}
+
+impl<'a> From<RemoteTracking<'a>> for Qualified<'a> {
     fn from(rt: RemoteTracking<'a>) -> Self {
         rt.0
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-pub struct Owned<'a>(Cow<'a, BStr>);
-
-/// Ensure that `name` is not a remote tracking branch.
-///
-/// Essentially removes `refs/remotes/*/` from `name`. Returns `None` if the
-/// result would be the empty string.
-pub fn owned<'a>(name: impl Into<Cow<'a, BStr>>) -> Option<Owned<'a>> {
-    use super::component::*;
-
-    let name = name.into();
-    match name.splitn(4, is_separator).collect::<Vec<_>>()[..] {
-        [REFS, REMOTES, _, rest] => (!rest.is_empty()).then(|| {
-            let mut name = BString::from(REFS);
-            name.insert_char(REFS.len(), '/');
-            name.insert_str(REFS.len() + 1, rest);
-            Owned(name.into())
-        }),
-        [REFS, REMOTES] | [REFS, REMOTES, _] => None,
-        _ => Some(Owned(name)),
+impl Display for RemoteTracking<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 
-impl Deref for Owned<'_> {
-    type Target = BStr;
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Hash)]
+pub struct Owned<'a>(Qualified<'a>);
+
+impl<'a> Owned<'a> {
+    pub fn into_remote_tracking<'b>(self, remote_id: &PeerId) -> RemoteTracking<'b> {
+        // SAFETY: `Qualified` is guaranteed to start with "refs"
+        let name = self.0.components().skip(1).collect::<RefString>();
+        RemoteTracking(Qualified::from((
+            lit::Refs,
+            lit::Remotes,
+            from_peer_id(remote_id).and(name),
+        )))
+    }
+
+    pub fn into_owned<'b>(self) -> Owned<'b> {
+        Owned(self.0.into_owned())
+    }
+}
+
+/// Ensure that `name` is not a remote tracking branch.
+///
+/// Essentially removes "refs/remotes/*/" from `name`. Note that the `link`
+/// naming convention applies, which, unlike standard git, mandates a category
+/// after the remote name. Eg.:
+///
+///     refs/remotes/xyz/heads/main
+///     refs/remotes/xyz/rad/id
+///
+/// Returns `None` if:
+///
+/// * `name` is namespaced (ie. starts with  "refs/namespaces/")
+/// * less then two components are found after "refs/remotes/*/"
+/// * `name` is an owned ref, but does not have a category. In other words, if
+///   `name` does not start with "refs/namespaces/" nor "refs/remotes/", but has
+///   less than three components.
+pub fn owned(name: Qualified) -> Option<Owned> {
+    let mut iter = name.components();
+    {
+        let refs = iter.next().and_then(|c| c.as_lit())?;
+        debug_assert_eq!(lit::Refs, refs, "`Qualified` must start with 'refs/'");
+    }
+    match (iter.next()?.as_str(), iter.next()?) {
+        (name::str::NAMESPACES, _) => None,
+        (name::str::REMOTES, _) => {
+            let cat = iter.next()?;
+            let name = iter
+                .next()
+                .map(|x| iter::once(x).chain(iter).collect::<RefString>())?;
+            let q = Qualified::from((lit::Refs, cat, name));
+            Some(Owned(q))
+        },
+        (_, _) => Some(Owned(name)),
+    }
+}
+
+impl<'a> Deref for Owned<'a> {
+    type Target = Qualified<'a>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl AsRef<BStr> for Owned<'_> {
-    fn as_ref(&self) -> &BStr {
+impl AsRef<RefStr> for Owned<'_> {
+    fn as_ref(&self) -> &RefStr {
         self
     }
 }
 
-impl<'a> From<Owned<'a>> for Cow<'a, BStr> {
+impl<U> From<parsed::Rad<U>> for Owned<'_>
+where
+    U: Urn,
+{
+    fn from(r: parsed::Rad<U>) -> Self {
+        Self(r.into())
+    }
+}
+
+impl<'a> From<Owned<'a>> for Qualified<'a> {
     fn from(o: Owned<'a>) -> Self {
         o.0
+    }
+}
+
+impl Display for Owned<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 
@@ -169,32 +242,33 @@ pub struct Scoped<'a, 'b> {
 ///
 ///     refs/remotes/<wanted_id>/heads/main
 ///
-/// This is used to determine the right 'scope' of a ref when fetching from
+/// This is used to determine the right "scope" of a ref when fetching from
 /// `remote_id`. `name` should generally not be a remote tracking branch itself,
 /// as that information is stripped.
 pub fn scoped<'a, 'b>(
     wanted_id: &'a PeerId,
     remote_id: &PeerId,
-    name: impl Into<Cow<'b, BStr>>,
+    name: impl Into<Qualified<'b>>,
 ) -> Scoped<'a, 'b> {
-    let own = owned(name).expect("BUG: `scoped` should receive valid remote tracking branches");
+    let name = name.into();
+    let own = owned(name).expect("BUG: `scoped` should receive valid refs");
     Scoped {
         scope: wanted_id,
         name: if wanted_id == remote_id {
             Left(own)
         } else {
-            Right(remote_tracking(wanted_id, own))
+            Right(own.into_remote_tracking(wanted_id))
         },
     }
 }
 
-impl AsRef<BStr> for Scoped<'_, '_> {
-    fn as_ref(&self) -> &BStr {
+impl AsRef<RefStr> for Scoped<'_, '_> {
+    fn as_ref(&self) -> &RefStr {
         self.name.as_ref().either(AsRef::as_ref, AsRef::as_ref)
     }
 }
 
-impl<'b> From<Scoped<'_, 'b>> for Cow<'b, BStr> {
+impl<'b> From<Scoped<'_, 'b>> for Qualified<'b> {
     fn from(s: Scoped<'_, 'b>) -> Self {
         s.name.either(Into::into, Into::into)
     }
