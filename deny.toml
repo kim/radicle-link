@@ -92,7 +92,9 @@ deny = [
     "NPL-1.0",
     "NPL-1.1",
     "Nokia",
-    "OpenSSL",
+# Temporarily neither allow nor deny. See:
+# https://github.com/EmbarkStudios/cargo-deny/pull/398
+#    "OpenSSL",
     "PHP-3.01",
     "QPL-1.0",
     "RPSL-1.0",
