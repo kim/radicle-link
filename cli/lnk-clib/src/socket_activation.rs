@@ -6,22 +6,33 @@
 //! Implementation of the systemd socket activation protocol.
 //! <http://0pointer.de/blog/projects/socket-activation.html>
 
-#[cfg(all(unix, not(target_os = "macos")))]
-mod unix;
-#[cfg(all(unix, not(target_os = "macos")))]
-pub use unix::{env_sockets, Error};
+use std::io;
+
+mod sd;
+pub use sd::Systemd;
 
 #[cfg(target_os = "macos")]
-mod osx;
+mod ld;
 #[cfg(target_os = "macos")]
-pub use osx::{env_sockets, Error};
+pub use ld::Launchd;
 
-use std::{net::TcpListener, os::unix::net::UnixListener};
+pub trait Sockets {
+    fn activate(&mut self, name: &str) -> io::Result<Vec<socket2::Socket>>;
+}
 
-/// The type of a socket found in the socket activated environment variables
-pub enum Socket {
-    /// A unix domain socket
-    Unix(UnixListener),
-    /// A TCP socket
-    Tcp(TcpListener),
+#[cfg(target_os = "macos")]
+pub fn default() -> io::Result<impl Sockets> {
+    Ok(Launchd)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn default() -> io::Result<impl Sockets> {
+    Systemd::from_env()
+}
+
+fn io_other<E>(error: E) -> io::Error
+where
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    io::Error::new(io::ErrorKind::Other, error)
 }

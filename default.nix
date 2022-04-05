@@ -23,5 +23,8 @@ in
         openssl
         pkgconfig
         rust
+
+        # testing utilities
+        gettext # for `envsubst`
     ];
   }
